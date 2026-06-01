@@ -1,0 +1,202 @@
+diff --git a/src/commands/clob.rs b/src/commands/clob.rs
+index b073f88..0000000 100644
+--- a/src/commands/clob.rs
++++ b/src/commands/clob.rs
+@@ -16,7 +16,7 @@ use crate::output::clob::{
+     print_tick_size, print_trades, print_user_earnings_markets,
+ };
+ use anyhow::Result;
+-use chrono::NaiveDate;
++use chrono::{DateTime, NaiveDate, Utc};
+ use clap::{Args, Subcommand};
+ use polymarket_client_sdk_v2::clob::types::{
+     Amount, AssetType, Interval, OrderType, Side, TimeRange,
+@@ -214,6 +214,9 @@ pub enum ClobCommand {
+         /// Order type: GTC, FOK, GTD, FAK (default: GTC)
+         #[arg(long, default_value = "GTC")]
+         order_type: CliOrderType,
++        /// Expiration timestamp for GTD orders, in Unix seconds
++        #[arg(long)]
++        expiration: Option<u64>,
+         /// Post-only order
+         #[arg(long)]
+         post_only: bool,
+@@ -236,6 +239,9 @@ pub enum ClobCommand {
+         /// Order type: GTC, FOK, GTD, FAK (default: GTC)
+         #[arg(long, default_value = "GTC")]
+         order_type: CliOrderType,
++        /// Expiration timestamp for GTD orders, in Unix seconds; applies to all orders
++        #[arg(long)]
++        expiration: Option<u64>,
+     },
+ 
+     /// Create a market order (authenticated)
+@@ -435,7 +441,7 @@ impl From<CliInterval> for Interval {
+     }
+ }
+ 
+-#[derive(Clone, Debug, clap::ValueEnum)]
++#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+ pub enum CliOrderType {
+     #[value(name = "GTC")]
+     Gtc,
+@@ -484,6 +490,26 @@ fn parse_date(s: &str) -> Result<NaiveDate> {
+         .map_err(|_| anyhow::anyhow!("Invalid date: expected YYYY-MM-DD format"))
+ }
+ 
++fn parse_expiration(ts: u64) -> Result<DateTime<Utc>> {
++    let ts_i64 = i64::try_from(ts)
++        .map_err(|_| anyhow::anyhow!("Invalid expiration: timestamp is too large"))?;
++
++    DateTime::<Utc>::from_timestamp(ts_i64, 0)
++        .ok_or_else(|| anyhow::anyhow!("Invalid expiration timestamp: {ts}"))
++}
++
++fn validate_expiration(is_gtd: bool, expiration: Option<u64>) -> Result<Option<DateTime<Utc>>> {
++    match (is_gtd, expiration) {
++        (true, Some(ts)) => Ok(Some(parse_expiration(ts)?)),
++        (true, None) => anyhow::bail!(
++            "--expiration is required when --order-type GTD. Use Unix seconds; for an effective lifetime of N seconds, use now + 60 + N."
++        ),
++        (false, Some(_)) => anyhow::bail!("--expiration can only be used with --order-type GTD"),
++        (false, None) => Ok(None),
++    }
++}
++
+ #[allow(clippy::too_many_lines)]
+ pub async fn execute(
+     args: ClobArgs,
+@@ -668,6 +694,7 @@ pub async fn execute(
+             price,
+             size,
+             order_type,
++            expiration,
+             post_only,
+         } => {
+             let signer = auth::resolve_signer(private_key)?;
+@@ -679,17 +706,22 @@ pub async fn execute(
+             let size_dec =
+                 Decimal::from_str(&size).map_err(|_| anyhow::anyhow!("Invalid size: {size}"))?;
+ 
+-            let order = client
++            let sdk_order_type = OrderType::from(order_type);
++            let expiration_dt = validate_expiration(matches!(order_type, CliOrderType::Gtd), expiration)?;
++
++            let order_builder = client
+                 .limit_order()
+                 .token_id(parse_token_id(&token)?)
+                 .side(Side::from(side))
+                 .price(price_dec)
+                 .size(size_dec)
+-                .order_type(OrderType::from(order_type))
+-                .post_only(post_only)
+-                .build()
+-                .await?;
++                .order_type(sdk_order_type)
++                .post_only(post_only);
++            let order = if let Some(expiration_dt) = expiration_dt {
++                order_builder.expiration(expiration_dt).build().await?
++            } else {
++                order_builder.build().await?
++            };
+             let signed_order = client.sign(&signer, order).await?;
+             let mut results = client.post_orders(vec![signed_order]).await?;
+             let result = results
+@@ -702,6 +734,7 @@ pub async fn execute(
+             prices,
+             sizes,
+             order_type,
++            expiration,
+         } => {
+             let signer = auth::resolve_signer(private_key)?;
+             let client = auth::authenticate_with_signer(&signer, signature_type).await?;
+@@ -718,6 +751,7 @@ pub async fn execute(
+ 
+             let sdk_side = Side::from(side);
+             let sdk_order_type = OrderType::from(order_type);
++            let expiration_dt = validate_expiration(matches!(order_type, CliOrderType::Gtd), expiration)?;
+ 
+             let mut signed_orders = Vec::with_capacity(token_ids.len());
+             for ((token_id, price_str), size_str) in
+@@ -729,16 +763,21 @@ pub async fn execute(
+                 let size_dec = Decimal::from_str(size_str)
+                     .map_err(|_| anyhow::anyhow!("Invalid size: {size_str}"))?;
+ 
+-                let order = client
++                let order_builder = client
+                     .limit_order()
+                     .token_id(token_id)
+                     .side(sdk_side)
+                     .price(price_dec)
+                     .size(size_dec)
+-                    .order_type(sdk_order_type.clone())
+-                    .build()
+-                    .await?;
++                    .order_type(sdk_order_type.clone());
++                let order = if let Some(expiration_dt) = expiration_dt {
++                    order_builder.expiration(expiration_dt).build().await?
++                } else {
++                    order_builder.build().await?
++                };
+                 signed_orders.push(client.sign(&signer, order).await?);
+             }
+ 
+@@ -1058,4 +1097,29 @@ mod tests {
+         assert!(parse_date("not-a-date").is_err());
+         assert!(parse_date("").is_err());
+     }
++
++    #[test]
++    fn parse_expiration_valid_unix_seconds() {
++        let expiration = parse_expiration(1_767_225_600).unwrap();
++        assert_eq!(expiration.timestamp(), 1_767_225_600);
++    }
++
++    #[test]
++    fn validate_expiration_requires_gtd_expiration() {
++        assert!(validate_expiration(true, None).is_err());
++    }
++
++    #[test]
++    fn validate_expiration_accepts_gtd_expiration() {
++        let expiration = validate_expiration(true, Some(1_767_225_600)).unwrap();
++        assert_eq!(expiration.unwrap().timestamp(), 1_767_225_600);
++    }
++
++    #[test]
++    fn validate_expiration_rejects_non_gtd_expiration() {
++        assert!(validate_expiration(false, Some(1_767_225_600)).is_err());
++    }
++
++    #[test]
++    fn validate_expiration_allows_non_gtd_without_expiration() {
++        assert!(validate_expiration(false, None).unwrap().is_none());
++    }
+ }
+diff --git a/README.md b/README.md
+index 7575d59..0000000 100644
+--- a/README.md
++++ b/README.md
+@@ -246,6 +246,13 @@ polymarket clob create-order \
+   --token 48331043336612883... \
+   --side buy --price 0.50 --size 10
+ 
++# Place a GTD limit order, expiring at a Unix timestamp
++polymarket clob create-order \
++  --token 48331043336612883... \
++  --side buy --price 0.50 --size 10 \
++  --order-type GTD \
++  --expiration 1767225600
++
+ # Place a market order (buy $5 worth)
+ polymarket clob market-order \
+   --token 48331043336612883... \
+@@ -273,7 +280,7 @@ polymarket clob update-balance --asset-type collateral
+ ```
+ 
+ **Order types**: `GTC` (default), `FOK`, `GTD`, `FAK`. Add `--post-only` for limit orders.
++For GTD limit orders, `--expiration` is required and must be a Unix timestamp in seconds. Polymarket applies a 60-second security threshold; for an effective lifetime of N seconds, use `now + 60 + N`.
+ 
+ ### Rewards & API Keys (CLOB, authenticated)
+ 
+```
